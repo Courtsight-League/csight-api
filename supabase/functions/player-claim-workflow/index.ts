@@ -25,7 +25,6 @@ const CLAIM_TEMPLATE_DEFAULT_BODY =
   'Hi {{fullName}},\n\nYou were added to {{teamName}} for {{season}}.\n\nClaim your Courtsight profile here:\n{{claimLink}}\n\nUse this link to set your password and access your player account.\n\nIf this was not you, please ignore this email or contact support.\n\nCourtsight League';
 
 const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
   'Access-Control-Allow-Methods': 'POST, OPTIONS',
 };
@@ -34,14 +33,72 @@ const TOKEN_TTL_MS = 72 * 60 * 60 * 1000;
 const RATE_LIMIT_WINDOW_MS = 60 * 60 * 1000;
 const RATE_LIMIT_MAX_ATTEMPTS = 5;
 
-const jsonResponse = (status: number, payload: Record<string, unknown>) =>
+const getAllowedOrigins = () =>
+  (Deno.env.get('ALLOWED_ORIGINS') ||
+    `${Deno.env.get('PUBLIC_SITE_URL') || 'http://localhost:3000'},http://localhost:3000,http://127.0.0.1:3000`)
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+const resolveCorsHeaders = (origin: string | null) => {
+  const allowedOrigins = getAllowedOrigins();
+  const allowOrigin =
+    origin && allowedOrigins.includes(origin)
+      ? origin
+      : allowedOrigins[0] || 'http://localhost:3000';
+
+  return {
+    ...corsHeaders,
+    'Access-Control-Allow-Origin': allowOrigin,
+    Vary: 'Origin',
+  };
+};
+
+const jsonResponse = (req: Request, status: number, payload: Record<string, unknown>) =>
   new Response(JSON.stringify(payload), {
     status,
     headers: {
-      ...corsHeaders,
+      ...resolveCorsHeaders(req.headers.get('origin')),
       'Content-Type': 'application/json',
     },
   });
+
+const validateOrigin = (req: Request) => {
+  const origin = req.headers.get('origin');
+  if (!origin) return true;
+  return getAllowedOrigins().includes(origin);
+};
+
+const getAuthenticatedUser = async (req: Request) => {
+  const authHeader = req.headers.get('authorization') || '';
+  const token = authHeader.replace(/^Bearer\s+/i, '').trim();
+  const supabaseUrl = Deno.env.get('SUPABASE_URL');
+  const anonKey = Deno.env.get('SUPABASE_ANON_KEY');
+
+  if (!token || !supabaseUrl || !anonKey) {
+    return null;
+  }
+
+  const supabaseUser = createClient(supabaseUrl, anonKey, {
+    global: {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    },
+    auth: {
+      persistSession: false,
+      autoRefreshToken: false,
+      detectSessionInUrl: false,
+    },
+  });
+
+  const { data, error } = await supabaseUser.auth.getUser();
+  if (error || !data?.user) {
+    return null;
+  }
+
+  return data.user;
+};
 
 const normalizeEmail = (value?: string | null) => String(value || '').trim().toLowerCase();
 const isValidEmail = (value: string) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
@@ -455,33 +512,42 @@ const findTokenRow = async (supabaseAdmin: any, token: string) => {
 };
 
 Deno.serve(async (req: Request) => {
-  if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders });
-  if (req.method !== 'POST') return jsonResponse(405, { ok: false, error: 'Method not allowed.' });
+  if (!validateOrigin(req)) {
+    return jsonResponse(req, 403, { ok: false, error: 'Origin not allowed.' });
+  }
+  if (req.method === 'OPTIONS') {
+    return new Response('ok', { headers: resolveCorsHeaders(req.headers.get('origin')) });
+  }
+  if (req.method !== 'POST') return jsonResponse(req, 405, { ok: false, error: 'Method not allowed.' });
 
   let payload: WorkflowPayload;
   try {
     payload = (await req.json()) as WorkflowPayload;
   } catch {
-    return jsonResponse(400, { ok: false, error: 'Invalid JSON payload.' });
+    return jsonResponse(req, 400, { ok: false, error: 'Invalid JSON payload.' });
   }
 
   const action = String(payload.action || '').trim() as WorkflowAction;
-  if (!action) return jsonResponse(400, { ok: false, error: 'Missing action.' });
+  if (!action) return jsonResponse(req, 400, { ok: false, error: 'Missing action.' });
 
   let supabaseAdmin: any;
   try {
     supabaseAdmin = getSupabaseAdmin();
   } catch (err: any) {
-    return jsonResponse(500, { ok: false, error: err?.message || 'Server configuration error.' });
+    return jsonResponse(req, 500, { ok: false, error: err?.message || 'Server configuration error.' });
   }
 
   const ipAddress = requestIp(req);
 
   try {
     if (action === 'send_claim_email') {
+      const authUser = await getAuthenticatedUser(req);
+      if (!authUser) {
+        return jsonResponse(req, 401, { ok: false, error: 'Authenticated caller required.' });
+      }
       const email = normalizeEmail(payload.email);
       if (!isValidEmail(email)) {
-        return jsonResponse(400, { ok: false, error: 'Invalid email address.' });
+        return jsonResponse(req, 400, { ok: false, error: 'Invalid email address.' });
       }
 
       const issued = await issueClaimToken(supabaseAdmin, {
@@ -513,7 +579,7 @@ Deno.serve(async (req: Request) => {
         outcome: 'sent',
       });
 
-      return jsonResponse(200, {
+      return jsonResponse(req, 200, {
         ok: true,
         sent: true,
         tokenId: issued.tokenId,
@@ -525,7 +591,7 @@ Deno.serve(async (req: Request) => {
     if (action === 'preview_claim') {
       const limited = await checkRateLimit(supabaseAdmin, ipAddress);
       if (limited) {
-        return jsonResponse(429, {
+        return jsonResponse(req, 429, {
           ok: false,
           error: 'Too many attempts. Please wait and try again later.',
         });
@@ -533,7 +599,7 @@ Deno.serve(async (req: Request) => {
 
       const token = String(payload.token || '').trim();
       if (!token) {
-        return jsonResponse(400, {
+        return jsonResponse(req, 400, {
           ok: false,
           status: 'invalid',
           error: 'Invalid or expired claim link.',
@@ -547,7 +613,7 @@ Deno.serve(async (req: Request) => {
           action,
           outcome: 'invalid-token',
         });
-        return jsonResponse(200, {
+        return jsonResponse(req, 200, {
           ok: true,
           status: 'invalid',
           message: 'This claim link is invalid or no longer available.',
@@ -563,7 +629,7 @@ Deno.serve(async (req: Request) => {
           action,
           outcome: 'already-claimed',
         });
-        return jsonResponse(200, {
+        return jsonResponse(req, 200, {
           ok: true,
           status: 'already_claimed',
           message: 'This profile has already been claimed. If this is incorrect, contact support.',
@@ -580,7 +646,7 @@ Deno.serve(async (req: Request) => {
           action,
           outcome: 'expired',
         });
-        return jsonResponse(200, {
+        return jsonResponse(req, 200, {
           ok: true,
           status: 'expired',
           message: 'This claim link has expired.',
@@ -597,7 +663,7 @@ Deno.serve(async (req: Request) => {
           action,
           outcome: 'no-profile',
         });
-        return jsonResponse(200, {
+        return jsonResponse(req, 200, {
           ok: true,
           status: 'invalid',
           message: 'This claim link is invalid or no longer available.',
@@ -616,7 +682,7 @@ Deno.serve(async (req: Request) => {
         details: { profileCount: profiles.length, claimableCount: claimableProfiles.length },
       });
 
-      return jsonResponse(200, {
+      return jsonResponse(req, 200, {
         ok: true,
         status,
         emailMasked: maskEmail(email),
@@ -640,7 +706,7 @@ Deno.serve(async (req: Request) => {
     if (action === 'confirm_claim') {
       const limited = await checkRateLimit(supabaseAdmin, ipAddress);
       if (limited) {
-        return jsonResponse(429, {
+        return jsonResponse(req, 429, {
           ok: false,
           error: 'Too many attempts. Please wait and try again later.',
         });
@@ -648,9 +714,9 @@ Deno.serve(async (req: Request) => {
 
       const token = String(payload.token || '').trim();
       const password = String(payload.password || '');
-      if (!token) return jsonResponse(400, { ok: false, error: 'Missing claim token.' });
+      if (!token) return jsonResponse(req, 400, { ok: false, error: 'Missing claim token.' });
       if (!isStrongPassword(password)) {
-        return jsonResponse(400, {
+        return jsonResponse(req, 400, {
           ok: false,
           error: 'Password must be at least 8 characters with at least one number and one special character.',
         });
@@ -663,7 +729,7 @@ Deno.serve(async (req: Request) => {
           action,
           outcome: 'invalid-token',
         });
-        return jsonResponse(400, { ok: false, status: 'invalid', error: 'Invalid or expired claim link.' });
+        return jsonResponse(req, 400, { ok: false, status: 'invalid', error: 'Invalid or expired claim link.' });
       }
       if (tokenRow.used_at) {
         await logClaimEvent(supabaseAdmin, {
@@ -674,7 +740,7 @@ Deno.serve(async (req: Request) => {
           action,
           outcome: 'already-claimed',
         });
-        return jsonResponse(400, {
+        return jsonResponse(req, 400, {
           ok: false,
           status: 'already_claimed',
           error: 'This profile has already been claimed. If this is incorrect, contact support.',
@@ -689,7 +755,7 @@ Deno.serve(async (req: Request) => {
           action,
           outcome: 'expired',
         });
-        return jsonResponse(400, {
+        return jsonResponse(req, 400, {
           ok: false,
           status: 'expired',
           error: 'This claim link has expired. Request a new one.',
@@ -706,7 +772,7 @@ Deno.serve(async (req: Request) => {
           action,
           outcome: 'no-profile',
         });
-        return jsonResponse(400, { ok: false, status: 'invalid', error: 'Invalid or expired claim link.' });
+        return jsonResponse(req, 400, { ok: false, status: 'invalid', error: 'Invalid or expired claim link.' });
       }
 
       const requestedPlayerId = String(payload.playerId || '').trim();
@@ -721,7 +787,7 @@ Deno.serve(async (req: Request) => {
         selectedProfile = profiles[0];
       }
       if (!selectedProfile) {
-        return jsonResponse(400, { ok: false, error: 'Please select the correct profile to claim.' });
+        return jsonResponse(req, 400, { ok: false, error: 'Please select the correct profile to claim.' });
       }
       if (selectedProfile.userId) {
         await logClaimEvent(supabaseAdmin, {
@@ -732,7 +798,7 @@ Deno.serve(async (req: Request) => {
           action,
           outcome: 'already-claimed-selected',
         });
-        return jsonResponse(400, {
+        return jsonResponse(req, 400, {
           ok: false,
           status: 'already_claimed',
           error: 'This profile has already been claimed. If this is incorrect, contact support.',
@@ -804,10 +870,10 @@ Deno.serve(async (req: Request) => {
         },
       });
 
-      return jsonResponse(200, {
+      return jsonResponse(req, 200, {
         ok: true,
         status: 'claimed',
-        email,
+        emailMasked: maskEmail(email),
         playerId: selectedProfile.id,
         userId,
         claimStatus,
@@ -816,6 +882,7 @@ Deno.serve(async (req: Request) => {
     }
 
     if (action === 'resend_claim_email') {
+      const authUser = await getAuthenticatedUser(req);
       let email = normalizeEmail(payload.email);
       let playerId = payload.playerId || null;
       let playerName = payload.playerName || null;
@@ -831,8 +898,12 @@ Deno.serve(async (req: Request) => {
         }
       }
 
+      if (!token && !authUser) {
+        return jsonResponse(req, 401, { ok: false, error: 'Authenticated caller required.' });
+      }
+
       if (!isValidEmail(email)) {
-        return jsonResponse(200, {
+        return jsonResponse(req, 200, {
           ok: true,
           sent: true,
           message: 'If your record exists, a new claim email has been sent.',
@@ -877,7 +948,7 @@ Deno.serve(async (req: Request) => {
         outcome: 'resent',
       });
 
-      return jsonResponse(200, {
+      return jsonResponse(req, 200, {
         ok: true,
         sent: true,
         expiresAt: issued.expiresAt,
@@ -885,9 +956,9 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    return jsonResponse(400, { ok: false, error: 'Unsupported action.' });
+    return jsonResponse(req, 400, { ok: false, error: 'Unsupported action.' });
   } catch (err: any) {
     const message = err?.message || 'Claim workflow request failed.';
-    return jsonResponse(500, { ok: false, error: message });
+    return jsonResponse(req, 500, { ok: false, error: message });
   }
 });

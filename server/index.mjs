@@ -5,6 +5,8 @@ import dotenv from 'dotenv';
 import Stripe from 'stripe';
 import nodemailer from 'nodemailer';
 import { randomUUID } from 'crypto';
+import dns from 'node:dns/promises';
+import net from 'node:net';
 import { createClient } from '@supabase/supabase-js';
 
 dotenv.config({ path: new URL('../.env.local', import.meta.url) });
@@ -20,6 +22,10 @@ const ADMIN_EMAILS = (process.env.ADMIN_NOTIFICATION_EMAILS || '')
   .split(',')
   .map((value) => value.trim())
   .filter(Boolean);
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || `${PUBLIC_SITE_URL},http://localhost:3000,http://127.0.0.1:3000`)
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean);
 const CURRENCY = (process.env.STRIPE_CURRENCY || 'cad').toLowerCase();
 const ALLOWED_COUNTRIES = (process.env.STRIPE_SHIPPING_COUNTRIES || 'CA,US')
   .split(',')
@@ -32,6 +38,15 @@ if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
   console.error('Missing Supabase API environment variables. Set SUPABASE_URL and SUPABASE_ANON_KEY.');
   process.exit(1);
 }
+
+const SUPABASE_HOSTNAME = new URL(SUPABASE_URL).hostname;
+const ALLOWED_IMAGE_PROXY_HOSTS = (
+  process.env.ALLOWED_IMAGE_PROXY_HOSTS ||
+  `${SUPABASE_HOSTNAME},ui-avatars.com,lh3.googleusercontent.com,images.unsplash.com`
+)
+  .split(',')
+  .map((value) => value.trim().toLowerCase())
+  .filter(Boolean);
 
 const supabaseAdmin = SUPABASE_SERVICE_ROLE_KEY
   ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
@@ -74,11 +89,37 @@ const formatCurrency = new Intl.NumberFormat('en-CA', {
 
 const app = express();
 app.use(cors({
-  origin: true,
+  origin(origin, callback) {
+    if (!origin) return callback(null, true);
+    if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    return callback(new Error('CORS origin not allowed.'));
+  },
   credentials: true,
 }));
 
-const toForwardHeaders = (headers, fallbackApiKey) => {
+const SAFE_SUPABASE_PATHS = [
+  /^\/auth\/v1\//,
+  /^\/rest\/v1\//,
+  /^\/storage\/v1\//,
+  /^\/functions\/v1\//,
+];
+
+const SAFE_SUPABASE_HEADERS = new Set([
+  'accept',
+  'accept-language',
+  'apikey',
+  'authorization',
+  'cache-control',
+  'content-profile',
+  'content-type',
+  'if-match',
+  'if-none-match',
+  'prefer',
+  'range',
+  'x-client-info',
+]);
+
+const toForwardHeaders = (headers) => {
   const nextHeaders = new Headers();
   for (const [key, value] of Object.entries(headers || {})) {
     if (!value) continue;
@@ -92,10 +133,10 @@ const toForwardHeaders = (headers, fallbackApiKey) => {
     ) {
       continue;
     }
+    if (!SAFE_SUPABASE_HEADERS.has(normalized)) {
+      continue;
+    }
     nextHeaders.set(key, Array.isArray(value) ? value.join(', ') : String(value));
-  }
-  if (fallbackApiKey && !nextHeaders.has('apikey')) {
-    nextHeaders.set('apikey', fallbackApiKey);
   }
   return nextHeaders;
 };
@@ -114,9 +155,17 @@ const pipeUpstreamResponse = async (upstream, res) => {
 
 app.use('/supabase', express.raw({ type: '*/*', limit: '25mb' }), async (req, res) => {
   try {
-    const upstreamUrl = new URL(req.originalUrl.replace(/^\/supabase/, ''), SUPABASE_URL);
+    const upstreamPath = req.originalUrl.replace(/^\/supabase/, '') || '/';
+    const isAllowedPath = SAFE_SUPABASE_PATHS.some((pattern) => pattern.test(upstreamPath));
+    if (!isAllowedPath) {
+      return res.status(403).json({ error: 'Supabase proxy path not allowed.' });
+    }
+    if (!req.headers.apikey && !req.headers.authorization) {
+      return res.status(401).json({ error: 'Missing Supabase auth headers.' });
+    }
+    const upstreamUrl = new URL(upstreamPath, SUPABASE_URL);
     const method = req.method.toUpperCase();
-    const headers = toForwardHeaders(req.headers, SUPABASE_ANON_KEY);
+    const headers = toForwardHeaders(req.headers);
     const init = {
       method,
       headers,
@@ -218,6 +267,55 @@ const normalizeRemoteUrl = (source) => {
   return remoteUrl;
 };
 
+const isPrivateIpAddress = (ip) => {
+  if (!ip) return true;
+  if (net.isIPv4(ip)) {
+    const [a, b] = ip.split('.').map(Number);
+    return (
+      a === 10 ||
+      a === 127 ||
+      (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168)
+    );
+  }
+  if (net.isIPv6(ip)) {
+    const normalized = ip.toLowerCase();
+    return normalized === '::1' || normalized.startsWith('fc') || normalized.startsWith('fd') || normalized.startsWith('fe80:');
+  }
+  return true;
+};
+
+const isAllowedAvatarHost = async (hostname) => {
+  const normalized = String(hostname || '').trim().toLowerCase();
+  if (!normalized || !ALLOWED_IMAGE_PROXY_HOSTS.includes(normalized)) {
+    return false;
+  }
+
+  if (net.isIP(normalized)) {
+    return !isPrivateIpAddress(normalized);
+  }
+
+  try {
+    const records = await dns.lookup(normalized, { all: true });
+    return records.length > 0 && records.every((record) => !isPrivateIpAddress(record.address));
+  } catch {
+    return false;
+  }
+};
+
+const resolveProductUnitPriceCents = (product) => {
+  const cents = Number(product?.price_cents ?? product?.unit_price_cents ?? product?.unitPriceCents);
+  if (Number.isFinite(cents) && cents > 0) {
+    return Math.round(cents);
+  }
+  const dollars = Number(product?.price ?? product?.unit_price ?? product?.unitPrice);
+  if (Number.isFinite(dollars) && dollars > 0) {
+    return Math.round(dollars * 100);
+  }
+  return 0;
+};
+
 app.get('/health', (_req, res) => {
   res.json({ ok: true });
 });
@@ -233,6 +331,9 @@ app.get('/api/avatar-proxy', async (req, res) => {
     if (!remoteUrl) {
       return res.status(400).json({ error: 'Invalid src URL' });
     }
+    if (!(await isAllowedAvatarHost(remoteUrl.hostname))) {
+      return res.status(403).json({ error: 'Avatar source host not allowed.' });
+    }
 
     const upstream = await fetch(remoteUrl.toString(), {
       redirect: 'follow',
@@ -245,12 +346,15 @@ app.get('/api/avatar-proxy', async (req, res) => {
     if (!upstream.ok) {
       return res.status(upstream.status).json({ error: `Upstream request failed (${upstream.status})` });
     }
+    const contentType = upstream.headers.get('content-type') || '';
+    if (!contentType.toLowerCase().startsWith('image/')) {
+      return res.status(415).json({ error: 'Avatar proxy only supports image responses.' });
+    }
 
     const body = Buffer.from(await upstream.arrayBuffer());
-    res.setHeader('Content-Type', upstream.headers.get('content-type') || 'application/octet-stream');
+    res.setHeader('Content-Type', contentType || 'application/octet-stream');
     res.setHeader('Content-Length', String(body.length));
     res.setHeader('Cache-Control', 'public, max-age=300');
-    res.setHeader('Access-Control-Allow-Origin', '*');
     return res.end(body);
   } catch (error) {
     console.error('Avatar proxy error', error);
@@ -502,13 +606,12 @@ app.post('/api/merch/create-checkout-session', async (req, res) => {
     .map((item) => ({
       productId: String(item.productId || ''),
       quantity: Math.max(0, Number(item.quantity) || 0),
-      unitPriceCents: Math.max(0, Number(item.unitPriceCents) || 0),
       name: String(item.name || 'Product'),
       variant: item.variant ? String(item.variant) : null,
       category: String(item.category || 'Accessories'),
       imageUrl: item.imageUrl ? String(item.imageUrl) : null,
     }))
-    .filter((item) => item.productId && item.quantity > 0 && item.unitPriceCents > 0);
+    .filter((item) => item.productId && item.quantity > 0);
 
   if (!normalizedCart.length) {
     return res.status(400).json({ error: 'Cart items are invalid.' });
@@ -542,7 +645,23 @@ app.post('/api/merch/create-checkout-session', async (req, res) => {
     }
   }
 
-  const totalAmount = normalizedCart.reduce((sum, item) => sum + item.quantity * item.unitPriceCents, 0);
+  const pricedCart = normalizedCart.map((item) => {
+    const product = productMap.get(item.productId);
+    const unitPriceCents = resolveProductUnitPriceCents(product);
+    return {
+      ...item,
+      unitPriceCents,
+      name: String(product?.name || item.name || 'Product'),
+      category: String(product?.category || item.category || 'Accessories'),
+      imageUrl: String(product?.image_url || product?.imageUrl || item.imageUrl || ''),
+    };
+  });
+
+  if (pricedCart.some((item) => item.unitPriceCents <= 0)) {
+    return res.status(400).json({ error: 'One or more products have invalid pricing.' });
+  }
+
+  const totalAmount = pricedCart.reduce((sum, item) => sum + item.quantity * item.unitPriceCents, 0);
   if (totalAmount <= 0) {
     return res.status(400).json({ error: 'Invalid cart pricing.' });
   }
@@ -589,7 +708,7 @@ app.post('/api/merch/create-checkout-session', async (req, res) => {
 
   try {
     await supabaseAdmin.from('merch_order_items').insert(
-      normalizedCart.map((item) => ({
+      pricedCart.map((item) => ({
         order_id: orderId,
         product_id: item.productId,
         quantity: item.quantity,
@@ -620,16 +739,12 @@ app.post('/api/merch/create-checkout-session', async (req, res) => {
   const metadata = {
     order_id: orderId,
     lead_time_days: String(leadTimeDays),
-    shipping_name: shipping.name,
-    shipping_email: shipping.email,
-    shipping_city: shipping.city,
-    ...(shipping.phone ? { shipping_phone: shipping.phone } : {}),
     ...(jersey?.teamName ? { jersey_team_name: jersey.teamName } : {}),
     ...(jersey?.contactName ? { jersey_contact_name: jersey.contactName } : {}),
     ...(jersey?.designUrl ? { jersey_design_url: jersey.designUrl } : {}),
   };
 
-  const lineItems = normalizedCart.map((item) => ({
+  const lineItems = pricedCart.map((item) => ({
     price_data: {
       currency: CURRENCY,
       unit_amount: item.unitPriceCents,
