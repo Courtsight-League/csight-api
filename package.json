@@ -1,0 +1,18 @@
+{
+  "name": "csight-api",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node server/index.mjs",
+    "build": "node --check server/index.mjs && node --check server.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.86.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "nodemailer": "^6.10.1",
+    "stripe": "^18.5.0"
+  }
+}
