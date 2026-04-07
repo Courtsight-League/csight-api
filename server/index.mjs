@@ -468,6 +468,150 @@ app.get('/admin/auth/user-by-id/:userId', requireAdmin(), async (req, res) => {
   }
 });
 
+app.post('/admin-users', express.json({ limit: '2mb' }), requireAdmin('full'), async (req, res) => {
+  try {
+    const email = String(req.body?.email || '').trim().toLowerCase();
+    const displayName = String(req.body?.displayName || '').trim() || email;
+    const role = String(req.body?.role || '').trim();
+
+    if (!email) {
+      return res.status(400).json({ error: 'Email is required.' });
+    }
+
+    if (!role) {
+      return res.status(400).json({ error: 'Role is required.' });
+    }
+
+    const charset = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()';
+    let tempPassword = '';
+    for (let i = 0; i < 14; i += 1) {
+      tempPassword += charset[Math.floor(Math.random() * charset.length)];
+    }
+
+    let userId = null;
+    let createdNewUser = false;
+
+    try {
+      const { data: profileByEmail } = await supabaseAdmin
+        .from('profiles')
+        .select('user_id')
+        .ilike('email', email)
+        .limit(1)
+        .maybeSingle();
+      userId = profileByEmail?.user_id || null;
+    } catch {}
+
+    if (!userId) {
+      try {
+        const { data: profileByAltEmail } = await supabaseAdmin
+          .from('profiles')
+          .select('user_id')
+          .ilike('email_address', email)
+          .limit(1)
+          .maybeSingle();
+        userId = profileByAltEmail?.user_id || null;
+      } catch {}
+    }
+
+    if (!userId) {
+      try {
+        const { data: authUser } = await supabaseAdmin.auth.admin.getUserByEmail(email);
+        userId = authUser?.user?.id || null;
+      } catch {}
+    }
+
+    if (!userId) {
+      const { data: created, error: createErr } = await supabaseAdmin.auth.admin.createUser({
+        email,
+        password: tempPassword,
+        email_confirm: false,
+        user_metadata: {
+          full_name: displayName,
+          temporary_password: tempPassword,
+        },
+      });
+      if (createErr) {
+        return res.status(400).json({ error: createErr.message });
+      }
+      userId = created?.user?.id ?? null;
+      createdNewUser = true;
+    }
+
+    if (createdNewUser) {
+      const redirectTo = `${PUBLIC_SITE_URL}/auth/callback?next=/reset-password`;
+      const { error: inviteErr } = await supabaseAdmin.auth.admin.inviteUserByEmail(email, {
+        redirectTo,
+      });
+      if (inviteErr) {
+        return res.status(400).json({ error: inviteErr.message });
+      }
+    }
+
+    const { data: existingAdmin, error: existingAdminErr } = await supabaseAdmin
+      .from('admin_users')
+      .select('id,user_id')
+      .ilike('email', email)
+      .limit(1)
+      .maybeSingle();
+    if (existingAdminErr) {
+      return res.status(400).json({ error: existingAdminErr.message });
+    }
+
+    if (existingAdmin?.id) {
+      const { error: adminUpdateErr } = await supabaseAdmin
+        .from('admin_users')
+        .update({
+          user_id: userId,
+          email,
+          display_name: displayName,
+          role,
+        })
+        .eq('id', existingAdmin.id);
+      if (adminUpdateErr) {
+        return res.status(400).json({ error: adminUpdateErr.message });
+      }
+    } else {
+      const { error: adminInsertErr } = await supabaseAdmin.from('admin_users').insert({
+        user_id: userId,
+        email,
+        display_name: displayName,
+        role,
+      });
+      if (adminInsertErr) {
+        return res.status(400).json({ error: adminInsertErr.message });
+      }
+    }
+
+    if (userId) {
+      const { error: profileErr } = await supabaseAdmin.from('profiles').upsert(
+        {
+          user_id: userId,
+          display_name: displayName,
+          email,
+          email_address: email,
+        },
+        { onConflict: 'user_id' }
+      );
+      if (profileErr) {
+        return res.status(400).json({ error: profileErr.message });
+      }
+    }
+
+    return res.json({
+      email,
+      tempPassword: createdNewUser ? tempPassword : '',
+      userId,
+      createdNewUser,
+      message: createdNewUser
+        ? `A confirmation email with the invite link has been sent to ${email}.`
+        : `${email} already has an account and was added as an admin.`,
+    });
+  } catch (error) {
+    console.error('Create admin user via API error', error);
+    return res.status(500).json({ error: 'Failed to create admin user.' });
+  }
+});
+
 const requiredShippingFields = [
   'name',
   'addressLine1',
