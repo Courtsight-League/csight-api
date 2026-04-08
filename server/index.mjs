@@ -202,6 +202,38 @@ const createUserClientFromAuthHeader = (authHeader) => {
   });
 };
 
+const findAuthUserByEmail = async (email) => {
+  const normalizedEmail = String(email || '').trim().toLowerCase();
+  if (!normalizedEmail) {
+    return null;
+  }
+
+  let page = 1;
+  const perPage = 200;
+
+  while (true) {
+    const { data, error } = await supabaseAdmin.auth.admin.listUsers({ page, perPage });
+    if (error) {
+      throw error;
+    }
+
+    const users = Array.isArray(data?.users) ? data.users : [];
+    const matchedUser = users.find(
+      (user) => String(user?.email || '').trim().toLowerCase() === normalizedEmail
+    );
+    if (matchedUser) {
+      return matchedUser;
+    }
+
+    const lastPage = Number(data?.lastPage || 0);
+    if (!users.length || (lastPage && page >= lastPage) || users.length < perPage) {
+      return null;
+    }
+
+    page += 1;
+  }
+};
+
 const requireAdmin = (minimumRole = 'any') => async (req, res, next) => {
   try {
     if (!supabaseAdmin) {
@@ -440,11 +472,8 @@ app.get('/admin/auth/user-by-email', requireAdmin(), async (req, res) => {
     if (!email) {
       return res.status(400).json({ error: 'Missing email.' });
     }
-    const { data, error } = await supabaseAdmin.auth.admin.getUserByEmail(email);
-    if (error) {
-      return res.status(400).json({ error: error.message });
-    }
-    return res.json(data);
+    const user = await findAuthUserByEmail(email);
+    return res.json({ user });
   } catch (error) {
     console.error('Get user by email error', error);
     return res.status(500).json({ error: 'Unable to load user.' });
@@ -515,8 +544,8 @@ app.post('/admin-users', express.json({ limit: '2mb' }), requireAdmin('full'), a
 
     if (!userId) {
       try {
-        const { data: authUser } = await supabaseAdmin.auth.admin.getUserByEmail(email);
-        userId = authUser?.user?.id || null;
+        const authUser = await findAuthUserByEmail(email);
+        userId = authUser?.id || null;
       } catch {}
     }
 
